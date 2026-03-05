@@ -101,19 +101,39 @@ class _SFTPFileWriter(io.BytesIO):
         """Context manager entry."""
         self._sftp_client = self.hook.get_conn()
         
-        # Ensure parent directories exist
+        # Ensure parent directories exist (create recursively)
         parts = self.path.split("/")
         if len(parts) > 1:
-            parent_dir = "/".join(parts[:-1])
-            try:
+            # Build directory path incrementally and create each level
+            current_path = ""
+            for part in parts[:-1]:  # Exclude the filename
+                if not part:  # Skip empty parts (from leading/trailing slashes)
+                    continue
+                if current_path:
+                    current_path = f"{current_path}/{part}"
+                else:
+                    current_path = part
+                
                 try:
-                    self._sftp_client.stat(parent_dir)
+                    # Check if directory exists
+                    self._sftp_client.stat(current_path)
                 except FileNotFoundError:
-                    # Directory doesn't exist, create it recursively
-                    self._sftp_client.mkdir(parent_dir)
-            except Exception:
-                # Directory might already exist or other error, ignore
-                pass
+                    # Directory doesn't exist, create it
+                    try:
+                        self._sftp_client.mkdir(current_path)
+                        logger.debug(f"Created directory: {current_path}")
+                    except Exception as e:
+                        # Directory might have been created by another process,
+                        # or there's a permission issue
+                        logger.warning(
+                            f"Could not create directory {current_path}: {e}"
+                        )
+                        # Try to verify it exists now
+                        try:
+                            self._sftp_client.stat(current_path)
+                        except FileNotFoundError:
+                            # Still doesn't exist, re-raise the error
+                            raise
         
         self._file_handle = self._sftp_client.open(self.path, "wb")
         return self
