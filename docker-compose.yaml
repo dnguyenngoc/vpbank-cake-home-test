@@ -23,7 +23,6 @@ x-airflow-common:
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
-    - ${AIRFLOW_PROJ_DIR:-.}/sftp:/opt/sftp
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on
@@ -233,6 +232,32 @@ services:
       _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
       _PIP_ADDITIONAL_REQUIREMENTS: ''
     user: "0:0"
+
+  # SFTP Server for testing (source)
+  sftp-source:
+    image: atmoz/sftp:latest
+    container_name: sftp_source
+    volumes:
+      - ./sftp/source:/home/testuser
+    command: testuser:testpass:1001:1001
+    ports:
+      - "2222:22"
+    restart: always
+    networks:
+      - default
+
+  # SFTP Server for testing (target)
+  sftp-target:
+    image: atmoz/sftp:latest
+    container_name: sftp_target
+    volumes:
+      - ./sftp/target:/home/testuser
+    command: testuser:testpass:1001:1001
+    ports:
+      - "2223:22"
+    restart: always
+    networks:
+      - default
 
 volumes:
   postgres-db-volume:
