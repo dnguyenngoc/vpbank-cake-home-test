@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.gitignore
+*.log
+venv/
+*.md
+tests/
+.venv
+.ruff_cache
+.ropeproject
+*.egg-info/
