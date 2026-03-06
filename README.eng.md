@@ -284,6 +284,198 @@ To add transformation (compress, encrypt, validate) before writing to target:
 
 See details in `airflow/dags/sync_sftp/README.md` section "Adding Transformation".
 
+## Implementation Details
+
+### Checksum Calculation
+- Checksum (MD5) is calculated during transfer to avoid reading file twice
+- Checksum is stored in state store for integrity verification
+- When checking if file is synced, prioritize checksum comparison (most reliable)
+- If checksum not available, fallback to comparing size and modified_at
+
+### Directory Structure Preservation
+- `SFTPFileRepository.open_write()` automatically creates parent directories if they don't exist
+- Ensures directory structure is preserved when syncing
+- No need to pre-create directories before transfer
+
+### Connection Management
+- Each SFTP operation opens and closes its own connection
+- Uses context manager to ensure connections are properly closed
+- Avoids connection leaks and timeout issues
+- Pool `sftp_transfer` can be uncommented in code to limit concurrent SFTP connections
+
+### Error Handling
+- Each file transfer has its own error handling, doesn't affect other files
+- Failed transfers are logged in detail for debugging
+- State is only updated when transfer succeeds
+- Retry 3 times with exponential backoff (2 minutes)
+
+### Code Structure
+```
+sync_sftp/
+├── sync_sftp_directly.py      # Main DAG
+├── core/                       # Abstractions
+│   ├── file_info.py           # FileInfo dataclass
+│   └── file_repository.py     # FileRepository interface
+├── repositories/              # Implementations
+│   └── sftp_repository.py     # SFTPFileRepository
+├── services/                  # Business logic
+│   └── file_sync_service.py  # FileSyncService
+├── state/                     # State management
+│   └── file_state_store.py   # FileStateStore
+└── utils/                     # Utilities
+    └── config.py             # Configuration loader
+```
+
+## Limitations & Production Readiness
+
+**Important Note**: This is a home test solution, not a production-ready system. Below are the points that are not implemented or need improvement for production use:
+
+### 1. Incremental Load Strategy
+**Current**: Each time the DAG runs, the `list_source_files` task scans the entire SFTP server to find all files.
+
+**Issues**:
+- With large SFTP servers (millions of files), listing all files every time will be very slow and resource-intensive
+- No incremental load mechanism (only scan new/changed files)
+
+**Production Solution**:
+- Implement incremental scan: only scan directories/files that have changed since last run
+- Use file system events or change log if SFTP server supports it
+- Cache directory structure and only refresh changed parts
+- Could implement "scan by date range" to only scan files modified in recent time period
+
+### 2. Rate Limiting & Throttling
+**Current**: No intelligent rate limiting, only limited by `max_active_tasks=4`.
+
+**Issues**:
+- Could overload SFTP server with too many concurrent connections
+- No adaptive throttling based on server response time
+- No backpressure mechanism
+
+**Production Solution**:
+- Implement adaptive rate limiting based on SFTP server response time
+- Throttle based on network bandwidth
+- Implement circuit breaker pattern to automatically reduce load when server is overloaded
+- Monitor SFTP server health and adjust concurrency dynamically
+
+### 3. Monitoring & Observability
+**Current**: Only basic logging, no metrics or distributed tracing.
+
+**Issues**:
+- No metrics for transfer rate, success rate, file size distribution
+- No alerting when issues occur
+- No dashboard to monitor health
+- No distributed tracing to debug performance issues
+
+**Production Solution**:
+- Integrate with Prometheus/Grafana to collect metrics
+- Set up alerting (PagerDuty, Slack) for failures, slow transfers, disk space issues
+- Implement structured logging with correlation IDs
+- Add distributed tracing (OpenTelemetry) to track request flow
+- Create dashboard to monitor: transfer rate, success rate, average file size, queue depth
+
+### 4. State Management Scalability
+**Current**: State stored in Airflow Variables (JSON), doesn't scale with millions of files.
+
+**Issues**:
+- Large JSON will slow down load/save operations
+- No transaction support → potential race conditions
+- No indexing → cannot query efficiently
+
+**Production Solution**:
+- Migrate to PostgreSQL with proper schema and indexes
+- Implement partitioning if needed (by date, directory)
+- Add transaction support to ensure consistency
+- Implement state cleanup strategy (archive old state, remove deleted files from state)
+
+### 5. Security & Compliance
+**Current**: Credentials stored in Airflow Connections, no encryption at rest.
+
+**Issues**:
+- No encryption for data in transit (SFTP has it, but may need additional TLS)
+- No audit logging for compliance
+- No access control/authorization
+- No data validation/verification
+
+**Production Solution**:
+- Use secrets backend (Vault, AWS Secrets Manager) instead of Airflow Connections
+- Implement audit logging for all operations (who, what, when)
+- Add data validation: verify file integrity, check file types, scan for malware
+- Implement access control: only sync files from authorized directories
+- Add compliance features: GDPR, data retention policies
+
+### 6. Error Recovery & Resilience
+**Current**: Has retry but no dead letter queue, no manual recovery mechanism.
+
+**Issues**:
+- Files that fail multiple times will be skipped, no way to retry later
+- No mechanism to recover from partial failures
+- No backup/recovery strategy
+
+**Production Solution**:
+- Implement dead letter queue for files that fail multiple times
+- Add manual retry mechanism via Airflow UI
+- Implement checkpoint/resume for large file transfers
+- Add backup strategy: snapshot state, backup critical files
+- Implement health checks and automatic recovery
+
+### 7. Performance Optimization
+**Current**: No optimization for large scale.
+
+**Issues**:
+- No connection pooling → overhead when opening/closing connections multiple times
+- No compression to reduce network bandwidth
+- No parallel transfer for single large file
+- No caching strategy
+
+**Production Solution**:
+- Implement connection pooling to reuse SFTP connections
+- Add compression (gzip) for text files to reduce transfer time
+- Implement multi-part upload for large files (if target supports it)
+- Add caching: cache file metadata, directory structure
+- Optimize checksum calculation: could use faster hash (xxHash) or parallel hash
+
+### 8. Cost Optimization
+**Current**: No cost optimization.
+
+**Issues**:
+- Transfer all files every time, not optimized for cost
+- No lifecycle management for old files
+
+**Production Solution**:
+- Implement incremental sync to only transfer new/changed files
+- Add lifecycle policies: archive old files, delete files after X days
+- Optimize transfer schedule: transfer during off-peak hours
+- Monitor and optimize network bandwidth usage
+
+### 9. Testing & Quality Assurance
+**Current**: No unit tests, integration tests, or performance tests.
+
+**Issues**:
+- No automated testing
+- No test coverage
+- No performance benchmarks
+
+**Production Solution**:
+- Add unit tests for all components
+- Add integration tests with test SFTP servers
+- Add performance tests: test with large files, many files, network failures
+- Add load testing to find bottlenecks
+- Implement CI/CD pipeline with automated testing
+
+### 10. Documentation & Operations
+**Current**: Has README but no runbook, detailed troubleshooting guide.
+
+**Issues**:
+- No runbook for common issues
+- No disaster recovery plan
+- No capacity planning guide
+
+**Production Solution**:
+- Create runbook with step-by-step troubleshooting
+- Document disaster recovery procedures
+- Add capacity planning guide: how to scale, resource requirements
+- Create operational playbooks for on-call engineers
+
 ## Testing
 
 The project has 2 SFTP test servers configured in `docker-compose.yaml`:

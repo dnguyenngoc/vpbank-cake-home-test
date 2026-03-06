@@ -284,6 +284,198 @@ Xem chi tiết trong `airflow/dags/sync_sftp/README.md` section "Migration từ 
 
 Xem chi tiết trong `airflow/dags/sync_sftp/README.md` section "Thêm Transformation".
 
+## Implementation Details
+
+### Checksum Calculation
+- Checksum (MD5) được tính toán trong quá trình transfer để tránh đọc file 2 lần
+- Checksum được lưu trong state store để verify integrity
+- Khi check file đã sync, ưu tiên so sánh checksum (đáng tin cậy nhất)
+- Nếu không có checksum, fallback sang so sánh size và modified_at
+
+### Directory Structure Preservation
+- `SFTPFileRepository.open_write()` tự động tạo parent directories nếu chưa tồn tại
+- Đảm bảo cấu trúc thư mục được giữ nguyên khi sync
+- Không cần pre-create directories trước khi transfer
+
+### Connection Management
+- Mỗi SFTP operation mở và đóng connection riêng
+- Sử dụng context manager để đảm bảo connection được đóng đúng cách
+- Tránh connection leak và timeout issues
+- Pool `sftp_transfer` có thể được uncomment trong code để giới hạn concurrent SFTP connections
+
+### Error Handling
+- Mỗi file transfer có error handling riêng, không ảnh hưởng file khác
+- Failed transfers được log chi tiết để debug
+- State chỉ được update khi transfer thành công
+- Retry 3 lần với exponential backoff (2 phút)
+
+### Code Structure
+```
+sync_sftp/
+├── sync_sftp_directly.py      # DAG chính
+├── core/                       # Abstractions
+│   ├── file_info.py           # FileInfo dataclass
+│   └── file_repository.py     # FileRepository interface
+├── repositories/              # Implementations
+│   └── sftp_repository.py     # SFTPFileRepository
+├── services/                  # Business logic
+│   └── file_sync_service.py  # FileSyncService
+├── state/                     # State management
+│   └── file_state_store.py   # FileStateStore
+└── utils/                     # Utilities
+    └── config.py             # Configuration loader
+```
+
+## Limitations & Production Readiness
+
+**Lưu ý quan trọng**: Đây là một home test solution, không phải production-ready system. Dưới đây là các điểm chưa được implement hoặc cần cải thiện để đưa vào production:
+
+### 1. Incremental Load Strategy
+**Hiện tại**: Mỗi lần DAG chạy, task `list_source_files` quét toàn bộ SFTP server để tìm tất cả files.
+
+**Vấn đề**:
+- Với SFTP server lớn (hàng triệu files), việc list toàn bộ files mỗi lần sẽ rất chậm và tốn tài nguyên
+- Không có cơ chế incremental load (chỉ scan files mới/thay đổi)
+
+**Giải pháp production**:
+- Implement incremental scan: chỉ scan directories/files đã thay đổi từ lần chạy trước
+- Sử dụng file system events hoặc change log nếu SFTP server hỗ trợ
+- Cache directory structure và chỉ refresh phần đã thay đổi
+- Có thể implement "scan by date range" để chỉ scan files modified trong khoảng thời gian gần đây
+
+### 2. Rate Limiting & Throttling
+**Hiện tại**: Không có rate limiting thông minh, chỉ giới hạn bằng `max_active_tasks=4`.
+
+**Vấn đề**:
+- Có thể overload SFTP server nếu có quá nhiều concurrent connections
+- Không có adaptive throttling dựa trên server response time
+- Không có backpressure mechanism
+
+**Giải pháp production**:
+- Implement adaptive rate limiting dựa trên SFTP server response time
+- Throttle dựa trên network bandwidth
+- Implement circuit breaker pattern để tự động giảm load khi server bị quá tải
+- Monitor SFTP server health và điều chỉnh concurrency dynamically
+
+### 3. Monitoring & Observability
+**Hiện tại**: Chỉ có basic logging, không có metrics hoặc distributed tracing.
+
+**Vấn đề**:
+- Không có metrics về transfer rate, success rate, file size distribution
+- Không có alerting khi có issues
+- Không có dashboard để monitor health
+- Không có distributed tracing để debug performance issues
+
+**Giải pháp production**:
+- Integrate với Prometheus/Grafana để collect metrics
+- Set up alerting (PagerDuty, Slack) cho failures, slow transfers, disk space issues
+- Implement structured logging với correlation IDs
+- Add distributed tracing (OpenTelemetry) để track request flow
+- Create dashboard để monitor: transfer rate, success rate, average file size, queue depth
+
+### 4. State Management Scalability
+**Hiện tại**: State lưu trong Airflow Variables (JSON), không scale với hàng triệu files.
+
+**Vấn đề**:
+- JSON quá lớn sẽ làm chậm việc load/save
+- Không có transaction support → có thể bị race condition
+- Không có indexing → không thể query hiệu quả
+
+**Giải pháp production**:
+- Migrate sang PostgreSQL với proper schema và indexes
+- Implement partitioning nếu cần (theo date, directory)
+- Add transaction support để đảm bảo consistency
+- Implement state cleanup strategy (archive old state, remove deleted files from state)
+
+### 5. Security & Compliance
+**Hiện tại**: Credentials lưu trong Airflow Connections, không có encryption at rest.
+
+**Vấn đề**:
+- Không có encryption cho data in transit (SFTP đã có, nhưng có thể cần thêm TLS)
+- Không có audit logging cho compliance
+- Không có access control/authorization
+- Không có data validation/verification
+
+**Giải pháp production**:
+- Use secrets backend (Vault, AWS Secrets Manager) thay vì Airflow Connections
+- Implement audit logging cho tất cả operations (who, what, when)
+- Add data validation: verify file integrity, check file types, scan for malware
+- Implement access control: chỉ sync files từ authorized directories
+- Add compliance features: GDPR, data retention policies
+
+### 6. Error Recovery & Resilience
+**Hiện tại**: Có retry nhưng không có dead letter queue, không có manual recovery mechanism.
+
+**Vấn đề**:
+- Files fail nhiều lần sẽ bị skip, không có cách nào retry sau
+- Không có mechanism để recover từ partial failures
+- Không có backup/recovery strategy
+
+**Giải pháp production**:
+- Implement dead letter queue cho files fail nhiều lần
+- Add manual retry mechanism qua Airflow UI
+- Implement checkpoint/resume cho large file transfers
+- Add backup strategy: snapshot state, backup critical files
+- Implement health checks và automatic recovery
+
+### 7. Performance Optimization
+**Hiện tại**: Chưa có optimization cho large scale.
+
+**Vấn đề**:
+- Không có connection pooling → overhead khi mở/đóng connection nhiều lần
+- Không có compression để giảm network bandwidth
+- Không có parallel transfer cho single large file
+- Không có caching strategy
+
+**Giải pháp production**:
+- Implement connection pooling để reuse SFTP connections
+- Add compression (gzip) cho text files để giảm transfer time
+- Implement multi-part upload cho large files (nếu target hỗ trợ)
+- Add caching: cache file metadata, directory structure
+- Optimize checksum calculation: có thể dùng faster hash (xxHash) hoặc parallel hash
+
+### 8. Cost Optimization
+**Hiện tại**: Không có cost optimization.
+
+**Vấn đề**:
+- Transfer tất cả files mỗi lần, không optimize cho cost
+- Không có lifecycle management cho old files
+
+**Giải pháp production**:
+- Implement incremental sync để chỉ transfer files mới/thay đổi
+- Add lifecycle policies: archive old files, delete files sau X days
+- Optimize transfer schedule: transfer vào off-peak hours
+- Monitor và optimize network bandwidth usage
+
+### 9. Testing & Quality Assurance
+**Hiện tại**: Không có unit tests, integration tests, hoặc performance tests.
+
+**Vấn đề**:
+- Không có automated testing
+- Không có test coverage
+- Không có performance benchmarks
+
+**Giải pháp production**:
+- Add unit tests cho tất cả components
+- Add integration tests với test SFTP servers
+- Add performance tests: test với large files, many files, network failures
+- Add load testing để tìm bottlenecks
+- Implement CI/CD pipeline với automated testing
+
+### 10. Documentation & Operations
+**Hiện tại**: Có README nhưng chưa có runbook, troubleshooting guide chi tiết.
+
+**Vấn đề**:
+- Không có runbook cho common issues
+- Không có disaster recovery plan
+- Không có capacity planning guide
+
+**Giải pháp production**:
+- Create runbook với step-by-step troubleshooting
+- Document disaster recovery procedures
+- Add capacity planning guide: how to scale, resource requirements
+- Create operational playbooks cho on-call engineers
+
 ## Testing
 
 Project đã có 2 SFTP test servers được cấu hình trong `docker-compose.yaml`:
